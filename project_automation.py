@@ -4,7 +4,10 @@ from PIL import Image, ImageEnhance
 import numpy as np
 import re
 from scipy.ndimage import label, binary_dilation
-import io, os, zipfile, imaplib, email
+import io, os, zipfile, imaplib, email, requests, json, datetime, smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.application import MIMEApplication
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -104,24 +107,39 @@ def find_match(did):
     return None
 
 def resolve_path(p):
-    """Resolve absolute, backslash-relative (\\input\\file.pdf), or bare filename paths."""
-    # Normalise: replace forward slashes with OS sep
+    """Resolve absolute, relative, or bare filename paths. Supports directories by picking the first PDF inside."""
     p = p.strip()
-    # 1. Try as-is (absolute path)
-    if os.path.isabs(p) and os.path.exists(p):
-        return p
-    # 2. Strip any leading slashes/backslashes and join with BASE_DIR
-    stripped = p.lstrip('/\\').replace('/', os.sep).replace('\\', os.sep)
+    
+    def check_and_return(target):
+        if not os.path.exists(target): return None
+        if os.path.isfile(target) and target.lower().endswith('.pdf'): return target
+        if os.path.isdir(target):
+            pdfs = sorted([f for f in os.listdir(target) if f.lower().endswith('.pdf')])
+            if pdfs: return os.path.join(target, pdfs[0])
+        return None
+
+    # 1. Try as-is (absolute or already relative to CWD)
+    res = check_and_return(p)
+    if res: return res
+
+    # 2. Try relative to BASE_DIR (with various prefix stripping)
+    # Strip leading ./ or / or \
+    stripped = p
+    if stripped.startswith('./'): stripped = stripped[2:]
+    stripped = stripped.lstrip('/\\').replace('/', os.sep).replace('\\', os.sep)
+    
     candidate = os.path.normpath(os.path.join(BASE_DIR, stripped))
-    if os.path.exists(candidate):
-        return candidate
-    # 3. Bare filename — search inside BASE_DIR recursively (max 2 levels)
+    res = check_and_return(candidate)
+    if res: return res
+
+    # 3. Bare filename search recursively (max 3 levels)
     bare = os.path.basename(stripped)
-    for root, _, files in os.walk(BASE_DIR):
-        if root.count(os.sep) - BASE_DIR.count(os.sep) > 2:
-            continue  # don't go too deep
-        if bare in files:
-            return os.path.join(root, bare)
+    if bare and bare.lower().endswith('.pdf'):
+        for root, _, files in os.walk(BASE_DIR):
+            if root.count(os.sep) - BASE_DIR.count(os.sep) > 3:
+                continue
+            if bare in files:
+                return os.path.join(root, bare)
     return None
 
 def fetch_pdf_path_from_email():
@@ -131,9 +149,14 @@ def fetch_pdf_path_from_email():
         mail.select("inbox")
         status, msgs = mail.search(None, '(UNSEEN SUBJECT "MASTER PDF")')
         if status != "OK" or not msgs[0]:
-            return None, None, None, "No new 'MASTER PDF' emails found."
+            return None, None, None, {}, "No new 'MASTER PDF' emails found."
+        
         lid = msgs[0].split()[-1]
         _, mdata = mail.fetch(lid, "(RFC822)")
+        found_path, att_bytes, att_name = None, None, None
+        meta = {}
+        sender = None
+
         for rp in mdata:
             if not isinstance(rp, tuple): continue
             msg = email.message_from_bytes(rp[1])
@@ -144,22 +167,42 @@ def fetch_pdf_path_from_email():
                     body += part.get_payload(decode=True).decode(errors="ignore")
                 elif ct == "text/html":
                     body += re.sub(r'<[^>]+>',' ',part.get_payload(decode=True).decode(errors="ignore"))
-            # Find PDF paths — allow spaces/commas in filenames, stop at newlines/HTML
-            patterns = [
-                r'[A-Za-z]:\\[^\r\n<>"]+?\.pdf',       # Windows abs: C:\path\file.pdf
-                r'\\\\?[a-zA-Z][^\r\n<>"]+?\.pdf',    # UNC or \input\file.pdf
-                r'\\[^\r\n<>"]+?\.pdf',               # backslash-relative: \input\file.pdf
-                r'(?:/|\.\/)[^\r\n<>"]+?\.pdf',       # forward-slash relative: /input/file.pdf
-                r'[^\r\n<>"]+?\.pdf',                 # bare filename: file.pdf
-            ]
-            found_path = None
-            for pat in patterns:
-                m = re.findall(pat, body, re.IGNORECASE)
-                if m:
-                    found_path = m[0].strip()
-                    break
-            # Attachment fallback
-            att_bytes, att_name = None, None
+            
+            if not sender:
+                sender = msg.get("From")
+            
+            # 1. Extract Metadata from table-like structure (as per user image)
+            patterns = {
+                "name":      r"Project name\s*[:\s]\s*([^\r\n<\"|]+)",
+                "id":        r"Project\s*[:\s]\s*([^\r\n<\"|]+)",
+                "c#":        r"c#\s*[:\s]\s*([^\r\n<\"|]+)",
+                "loc":       r"Location of data\s*[:\s]\s*([^\r\n<\"|]+)",
+                "manager":   r"Project manager\s*[:\s]\s*([^\r\n<\"|]+)",
+                "received":  r"Recevied on\s*[:\s]\s*([^\r\n<\"|]+)"
+            }
+            for k, pat in patterns.items():
+                m = re.search(pat, body, re.IGNORECASE)
+                if m: meta[k] = m.group(1).strip()
+            
+            # 2. Identify the PDF path
+            if "loc" in meta:
+                found_path = meta["loc"]
+            else:
+                # Fallback to generic PDF regex
+                pdf_patterns = [
+                    r'[A-Za-z]:\\[^\r\n<>"]+?\.pdf',
+                    r'\\\\?[a-zA-Z][^\r\n<>"]+?\.pdf',
+                    r'\\[^\r\n<>"]+?\.pdf',
+                    r'(?:/|\.\/)[^\r\n<>"]+?\.pdf',
+                    r'[^\r\n<>"]+?\.pdf',
+                ]
+                for pat in pdf_patterns:
+                    m = re.findall(pat, body, re.IGNORECASE)
+                    if m:
+                        found_path = m[0].strip()
+                        break
+            
+            # 3. Attachment fallback
             for part in msg.walk():
                 if part.get_content_maintype()=="multipart": continue
                 if part.get("Content-Disposition") is None: continue
@@ -168,15 +211,17 @@ def fetch_pdf_path_from_email():
                     att_bytes = io.BytesIO(part.get_payload(decode=True))
                     att_name  = fn
                     break
+        
         mail.logout()
-        return found_path, att_bytes, att_name, None
+        if sender: meta['sender'] = sender
+        return found_path, att_bytes, att_name, meta, None
     except Exception as e:
-        return None, None, None, f"Gmail Error: {e}"
+        return None, None, None, {}, f"Gmail Error: {e}"
 
 
 # ── SESSION STATE ─────────────────────────────────────────────────────────────
 
-for k,v in {"step":1,"logs":[],"pdf_path":None,"pdf_bytes":None,"pdf_name":None,
+for k,v in {"step":1,"logs":[],"pdf_path":None,"pdf_bytes":None,"pdf_name":None, "meta":{},
              "results":[],"auto_pdf_bytes":None,"auto_zip_bytes":None,"autorun":False}.items():
     if k not in st.session_state:
         st.session_state[k]=v
@@ -225,6 +270,13 @@ def sidebar():
             f'<div><p class="step-label">{lbl}</p><p class="step-desc">{desc}</p></div>'
             f'</div>', unsafe_allow_html=True)
     st.sidebar.markdown("---")
+    if st.session_state.meta:
+        m = st.session_state.meta
+        st.sidebar.markdown(f"📂 **Project:** {m.get('name','Unknown')}")
+        if 'id' in m: st.sidebar.markdown(f"🆔 **ID:** {m['id']}")
+        if 'manager' in m: st.sidebar.markdown(f"👤 **PM:** {m['manager']}")
+        st.sidebar.markdown("---")
+
     if os.path.exists(DB_PATH):
         cnt = len([f for f in os.listdir(DB_PATH) if f.endswith('.pdf')])
         st.sidebar.success(f"🗄️ DB: {cnt} revisions")
@@ -232,6 +284,94 @@ def sidebar():
         st.sidebar.error("⚠️ Revisions DB missing")
     if GMAIL_USER:
         st.sidebar.info(f"📧 {GMAIL_USER}")
+
+def save_to_disk_and_notify():
+    meta = st.session_state.get('meta', {})
+    proj_name = meta.get('name', 'Unknown_Project').strip()
+    pdf_name  = st.session_state.get('pdf_name', 'Input_File')
+    if not pdf_name.lower().endswith('.pdf'): pdf_name += '.pdf'
+    
+    # Clean names for filesystem
+    safe_proj = re.sub(r'[^a-zA-Z0-9_\-\s]', '', proj_name).replace(' ', '_')
+    safe_pdf_folder = re.sub(r'[^a-zA-Z0-9_\-\s]', '', pdf_name.replace('.pdf','').replace('.PDF','')).replace(' ', '_')
+    
+    # Build structure: outputs/{project_name}/{input_file_folder}/
+    base_dir = os.path.join(BASE_DIR, "outputs", safe_proj, safe_pdf_folder)
+    review_dir = os.path.join(base_dir, "review", "overlays and revisons")
+    os.makedirs(review_dir, exist_ok=True)
+    
+    # 1. Save original input file copy in the base folder
+    input_path = os.path.join(base_dir, pdf_name)
+    if st.session_state.pdf_bytes:
+        with open(input_path, "wb") as f:
+            f.write(st.session_state.pdf_bytes)
+    
+    # 2. Save generated outputs in the review folder
+    master_path = os.path.join(review_dir, "COMBINED_MASTER.pdf")
+    zip_path = os.path.join(review_dir, "Overlay_Package.zip")
+    
+    if st.session_state.auto_pdf_bytes:
+        with open(master_path, "wb") as f:
+            f.write(st.session_state.auto_pdf_bytes)
+    
+    if st.session_state.auto_zip_bytes:
+        with open(zip_path, "wb") as f:
+            f.write(st.session_state.auto_zip_bytes)
+        
+    log(f"Saved to: outputs/{safe_proj}/{safe_pdf_folder}/...", "ok")
+    
+    # Webhook
+    try:
+        url = "https://pavanvikas.app.n8n.cloud/webhook/b9a26a30-3d2b-408b-b515-d7063e6916eb"
+        payload = {
+          "Project": meta.get('id', 'N/A'),
+          "Project_Name": proj_name,
+          "Project_message": f"Overlay processing complete for {len(st.session_state.results)} pages.",
+          "C#": meta.get('c#', 'N/A'),
+          "Pages": str(len(st.session_state.results)),
+          "Recevied_on": meta.get('received', datetime.datetime.now().strftime("%Y-%m-%d")),
+          "Returend_on": datetime.datetime.now().strftime("%Y-%m-%d"),
+          "Review_by": meta.get('manager', 'System'),
+          "General_notes": f"Automated processing. Saved to {review_dir}",
+          "Progress_status": "Completed",
+          "Kahua_updates": "Updated"
+        }
+        headers = { 'Content-Type': 'application/json' }
+        response = requests.post(url, headers=headers, json=payload)
+        log(f"Webhook sent: {response.status_code} {response.reason}", "ok")
+    except Exception as e:
+        log(f"Webhook failed: {e}", "err")
+
+    # 3. Email Reply
+    sender = meta.get('sender')
+    if sender and GMAIL_USER and GMAIL_PASS:
+        try:
+            log(f"Sending reply to {sender}...", "info")
+            msg = MIMEMultipart()
+            msg['From'] = GMAIL_USER
+            msg['To'] = sender
+            msg['Subject'] = f"RE: MASTER PDF - {proj_name}"
+            
+            body = f"""
+Project name: {proj_name}
+Project: {meta.get('id', 'N/A')}
+c#: {meta.get('c#', 'N/A')}
+Project manager: {meta.get('manager', 'N/A')}
+Recevied on: {meta.get('received', 'N/A')}
+Status: Completed
+Pages Processed: {len(st.session_state.results)}
+
+The overlay processing is complete. Please find the attached files.
+Outputs saved to: {review_dir}
+"""
+            msg.attach(MIMEText(body, 'plain'))
+            
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+                server.login(GMAIL_USER, GMAIL_PASS)
+                server.send_message(msg)
+            log("Reply email sent successfully!", "ok")
+        except Exception as e:
+            log(f"Email reply failed: {e}", "err")
 
 
 # ── STEPS ─────────────────────────────────────────────────────────────────────
@@ -246,11 +386,16 @@ def step1():
             st.error("Gmail credentials missing in .env!"); return
         with st.spinner("Connecting to Gmail…"):
             log(f"Connecting as {GMAIL_USER}…")
-            found_path, att, att_name, err = fetch_pdf_path_from_email()
+            found_path, att, att_name, meta, err = fetch_pdf_path_from_email()
         if err:
             log(err,"err"); st.error(err); return
+        
+        st.session_state.meta = meta
+        if meta.get('name'):
+            log(f"Project found: {meta['name']} (ID: {meta.get('id','N/A')})", "ok")
+
         if found_path:
-            log(f"Path in email: {found_path}","ok")
+            log(f"Location of data: {found_path}","ok")
             st.session_state.pdf_path = found_path
             st.session_state.pdf_name = os.path.basename(found_path)
         elif att:
@@ -399,10 +544,12 @@ def step4():
             zf.writestr(f"Page_{idx+1}_Overlay.pdf",buf.getvalue())
         zf.writestr("COMBINED_MASTER.pdf",st.session_state.auto_pdf_bytes)
     st.session_state.auto_zip_bytes = zip_buf.getvalue()
-    pack.progress(100, text="Package ready ✓")
-
     st.session_state.results = results
     log("All done!","ok")
+    
+    # Automated Saving and Webhook
+    save_to_disk_and_notify()
+    
     st.session_state.step = 5
     st.rerun()
 
